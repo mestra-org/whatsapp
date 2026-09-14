@@ -463,13 +463,16 @@ func (wa *WhatsAppClient) syncAltGhostWithInfo(ctx context.Context, jid types.JI
 			Msg("Failed to get ghost for alternate JID")
 		return
 	}
-	if ghost.AvatarID == "" {
-		altInfo := *info
-		altInfo.ExtraUpdates = bridgev2.MergeExtraUpdaters(info.ExtraUpdates, wa.fetchGhostAvatar)
-		info = &altInfo
+	info := makeInfoFromGhost(mainGhost)
+	if mainGhost.AvatarID == "" {
+		// The main ghost's avatar is unknown (never fetched or the fetch failed), so don't clear
+		// the alternate ghost's avatar, and fetch it directly if it doesn't have one either.
+		info.Avatar = nil
+		if ghost.AvatarID == "" {
+			info.ExtraUpdates = wa.fetchGhostAvatar
+		}
 	}
-
-	ghost.UpdateInfo(ctx, makeInfoFromGhost(mainGhost))
+	ghost.UpdateInfo(ctx, info)
 	log.Debug().
 		Stringer("jid", jid).
 		Stringer("alternate_jid", altJID).
