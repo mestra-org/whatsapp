@@ -1,0 +1,101 @@
+---
+# Deploy the WhatsApp bridge:  -e bridge_image_tag=2026-09-12-120000
+#
+# The bridge is a singleton — it holds the appservice registration and the
+# WhatsApp device sessions — so there is no `docker rollout` here. The old
+# container is stopped and removed, the compose file is rewritten with the new
+# tag, and the new container is started. Only the image tag ever changes; the
+# Postgres service, its bind-mounted data and ./config (config.yaml,
+# registration.yaml) are left untouched, so the database survives every deploy.
+- name: Deploy the WhatsApp bridge
+  hosts: mestra
+  become: false
+
+  vars:
+    bridge_dir: /srv/matrix/bridge-whatsapp
+    bridge_project: matrix-bridge-whatsapp
+    bridge_service: bridge
+    bridge_owner: admin
+    bridge_image: ghcr.io/mestra-org/whatsapp
+    bridge_network: matrix-internal
+    bridge_postgres_data: /data/matrix/bridge-whatsapp/postgres
+
+  tasks:
+    - name: Require the variables that have no default
+      ansible.builtin.assert:
+        that:
+          - bridge_image_tag is defined
+        fail_msg: >-
+          Pass bridge_image_tag, e.g. -e bridge_image_tag=2026-09-12-120000
+
+    - name: Create the deploy directory
+      ansible.builtin.file:
+        path: "{{ bridge_dir }}"
+        state: directory
+        owner: "{{ bridge_owner }}"
+        group: "{{ bridge_owner }}"
+        mode: "0755"
+
+    # config.yaml and registration.yaml are host-managed secrets: Ansible never
+    # writes them, it only refuses to deploy a bridge that would start without them.
+    # docker-run.sh exits instead of starting when either is missing.
+    - name: Check the bridge config
+      ansible.builtin.stat:
+        path: "{{ bridge_dir }}/config/config.yaml"
+      register: bridge_config
+
+    - name: Require the bridge config
+      ansible.builtin.assert:
+        that:
+          - bridge_config.stat.exists
+        fail_msg: >-
+          {{ bridge_dir }}/config/config.yaml is missing on the host.
+          The bridge config and registration are managed by hand, not by this playbook.
+
+    - name: Create .env if it does not exist
+      ansible.builtin.copy:
+        content: ""
+        dest: "{{ bridge_dir }}/.env"
+        owner: "{{ bridge_owner }}"
+        group: "{{ bridge_owner }}"
+        mode: "0600"
+        force: false
+
+    - name: Check if the network exists
+      ansible.builtin.command: docker network inspect {{ bridge_network }}
+      register: network
+      failed_when: false
+      changed_when: false
+
+    - name: Create the network
+      ansible.builtin.command: docker network create {{ bridge_network }}
+      when: network.rc != 0
+
+    - name: Check for an existing stack
+      ansible.builtin.stat:
+        path: "{{ bridge_dir }}/docker-compose.yml"
+      register: existing_compose
+
+    - name: Stop and remove the old bridge container
+      ansible.builtin.command: docker compose rm --stop --force {{ bridge_service }}
+      args:
+        chdir: "{{ bridge_dir }}"
+      when: existing_compose.stat.exists
+
+    - name: Write docker-compose.yml
+      ansible.builtin.template:
+        src: docker-compose.yml.j2
+        dest: "{{ bridge_dir }}/docker-compose.yml"
+        owner: "{{ bridge_owner }}"
+        group: "{{ bridge_owner }}"
+        mode: "0644"
+
+    - name: Pull the image
+      ansible.builtin.command: docker compose pull {{ bridge_service }}
+      args:
+        chdir: "{{ bridge_dir }}"
+
+    - name: Start the new bridge container
+      ansible.builtin.command: docker compose up -d --wait --wait-timeout 180
+      args:
+        chdir: "{{ bridge_dir }}"

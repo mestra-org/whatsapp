@@ -1,0 +1,83 @@
+name: release
+
+# Push a release-* tag -> build the image and deploy it to production.
+#
+# Tag a release:  make release
+on:
+  push:
+    tags:
+      - "release-*"
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+
+    steps:
+      # The version stamp comes from git, not from build args: build.sh runs
+      # maubuild, which shells out to `git rev-parse HEAD` and
+      # `git describe --exact-match --tags` inside the builder stage and sets
+      # main.Tag / main.Commit / main.BuildTime itself. That is why there is no
+      # .dockerignore excluding .git, and why the Dockerfile is untouched
+      # upstream's.
+      - uses: actions/checkout@v4
+
+      - name: Resolve the image tag
+        id: meta
+        run: echo "image_tag=${GITHUB_REF_NAME#release-}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to ghcr.io
+        run: echo '${{ secrets.GHCR_TOKEN }}' | docker login ghcr.io -u mestra-chat --password-stdin
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/mestra-org/whatsapp:${{ steps.meta.outputs.image_tag }}
+          cache-from: type=registry,ref=ghcr.io/mestra-org/whatsapp:buildcache
+          cache-to: type=registry,ref=ghcr.io/mestra-org/whatsapp:buildcache,mode=max
+
+  deploy:
+    needs: build-push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Ansible
+        run: pipx install ansible-core
+
+      - name: Set up the SSH key
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo '${{ secrets.SSH_PRIVATE_KEY }}' > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p '${{ secrets.SSH_PORT }}' -H '${{ secrets.SSH_HOST }}' >> ~/.ssh/known_hosts
+
+      - name: Write the inventory
+        working-directory: deploy/ansible
+        run: |
+          echo "[mestra]" > inventory.ini
+          echo "${{ secrets.SSH_HOST }} ansible_user=${{ secrets.SSH_USER }} ansible_port=${{ secrets.SSH_PORT }}" >> inventory.ini
+
+      - name: Run the playbook
+        working-directory: deploy/ansible
+        run: |
+          ansible-playbook -i inventory.ini deploy.yml \
+            -e bridge_image_tag='${{ needs.build-push.outputs.image_tag }}' \
+            -e bridge_owner='${{ secrets.SSH_USER }}'

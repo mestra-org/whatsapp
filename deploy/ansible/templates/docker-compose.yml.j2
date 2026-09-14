@@ -1,0 +1,70 @@
+# Managed by Ansible. Do not edit on the host.
+name: {{ bridge_project }}
+
+services:
+  whatsapp-postgres:
+    image: postgres:17
+    container_name: matrix-whatsapp-postgres
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      PGDATA: /var/lib/postgresql/data/pgdata
+    command:
+      - postgres
+      - -c
+      - max_connections=50
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - effective_cache_size=768MB
+      - -c
+      - work_mem=8MB
+      - -c
+      - maintenance_work_mem=128MB
+      - -c
+      - log_min_duration_statement=1000
+    volumes:
+      - {{ bridge_postgres_data }}:/var/lib/postgresql/data
+    networks:
+      {{ bridge_network }}:
+        aliases:
+          - whatsapp-postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    shm_size: 128mb
+    mem_limit: 1g
+    mem_reservation: 256m
+    cpus: 1.0
+    stop_grace_period: 60s
+
+  {{ bridge_service }}:
+    image: {{ bridge_image }}:{{ bridge_image_tag }}
+    container_name: matrix-bridge-whatsapp
+    restart: unless-stopped
+    depends_on:
+      whatsapp-postgres:
+        condition: service_healthy
+    volumes:
+      - ./config:/data:rw
+    networks:
+      {{ bridge_network }}:
+        aliases:
+          - bridge-whatsapp
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:29318/_matrix/mau/live"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    mem_limit: 2g
+    mem_reservation: 256m
+    cpus: 2.0
+    stop_grace_period: 30s
+
+networks:
+  {{ bridge_network }}:
+    external: true
