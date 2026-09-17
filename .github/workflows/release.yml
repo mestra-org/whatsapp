@@ -30,6 +30,13 @@ jobs:
       # upstream's.
       - uses: actions/checkout@v4
 
+      # The bridge sets SemCalVer, so any tag maubuild finds must look like
+      # upstream's v0.YYMM.N or the binary panics on startup ("invalid semver").
+      # Our release-* tags don't, so hide it from `git describe`; the bridge
+      # then reports v<base>+dev.<commit>, which still pins the exact build.
+      - name: Hide the release tag from maubuild
+        run: git tag -d "$GITHUB_REF_NAME"
+
       - name: Resolve the image tag
         id: meta
         run: echo "image_tag=${GITHUB_REF_NAME#release-}" >> "$GITHUB_OUTPUT"
