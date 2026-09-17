@@ -14,7 +14,7 @@
   vars:
     bridge_dir: /srv/matrix/bridge-whatsapp
     bridge_project: matrix-bridge-whatsapp
-    bridge_service: bridge
+    bridge_service: bridge-whatsapp
     bridge_owner: admin
     bridge_image: ghcr.io/mestra-org/whatsapp
     bridge_network: matrix-internal
