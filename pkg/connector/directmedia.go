@@ -34,6 +34,7 @@ import (
 	"go.mau.fi/util/ptr"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waMmsRetry"
+	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/bridgev2"
@@ -171,10 +172,68 @@ func (wa *WhatsAppConnector) downloadStickerDirectMedia(ctx context.Context, par
 	return wa.makeDirectMediaResponse(ctx, waClient, sticker, sticker.MimeType, "", nil, params)
 }
 
-func (wa *WhatsAppConnector) downloadMessageDirectMedia(ctx context.Context, parsedID *waid.ParsedMediaID, params map[string]string) (mediaproxy.GetMediaResponse, error) {
+// altSenderForMediaID finds the other addressing form (LID or phone number) of the sender
+// encoded in a media ID, so media IDs generated before the sender was normalized can still
+// be resolved to the message row, which always stores the LID form in LID chats.
+func (wa *WhatsAppConnector) altSenderForMediaID(ctx context.Context, parsedID *waid.ParsedMediaID) types.JID {
+	ul := wa.Bridge.GetCachedUserLoginByID(parsedID.UserLogin)
+	if ul == nil {
+		return types.EmptyJID
+	}
+	waClient, ok := ul.Client.(*WhatsAppClient)
+	if !ok || waClient.Client == nil {
+		return types.EmptyJID
+	}
+	sender := parsedID.Message.Sender.ToNonAD()
+	var alt types.JID
+	var err error
+	switch sender.Server {
+	case types.DefaultUserServer:
+		if sender.User == waClient.JID.User {
+			return waClient.GetLID().ToNonAD()
+		}
+		alt, err = waClient.GetStore().LIDs.GetLIDForPN(ctx, sender)
+	case types.HiddenUserServer:
+		if sender.User == waClient.GetLID().User {
+			return waClient.JID.ToNonAD()
+		}
+		alt, err = waClient.GetStore().LIDs.GetPNForLID(ctx, sender)
+	default:
+		return types.EmptyJID
+	}
+	if err != nil {
+		zerolog.Ctx(ctx).Warn().Err(err).Stringer("sender", sender).
+			Msg("Failed to look up alternate sender JID for media ID")
+		return types.EmptyJID
+	}
+	return alt
+}
+
+func (wa *WhatsAppConnector) getMessageForDirectMedia(ctx context.Context, parsedID *waid.ParsedMediaID) (*database.Message, error) {
 	msg, err := wa.Bridge.DB.Message.GetFirstPartByID(ctx, parsedID.UserLogin, parsedID.Message.String())
 	if err != nil {
 		return nil, fmt.Errorf("failed to get message: %w", err)
+	} else if msg != nil {
+		return msg, nil
+	}
+	altSender := wa.altSenderForMediaID(ctx, parsedID)
+	if altSender.IsEmpty() {
+		return nil, nil
+	}
+	altID := waid.MakeMessageID(parsedID.Message.Chat, altSender, parsedID.Message.ID)
+	zerolog.Ctx(ctx).Debug().Str("alt_message_id", string(altID)).
+		Msg("Message not found with sender from media ID, retrying with alternate sender")
+	msg, err = wa.Bridge.DB.Message.GetFirstPartByID(ctx, parsedID.UserLogin, altID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get message with alternate sender: %w", err)
+	}
+	return msg, nil
+}
+
+func (wa *WhatsAppConnector) downloadMessageDirectMedia(ctx context.Context, parsedID *waid.ParsedMediaID, params map[string]string) (mediaproxy.GetMediaResponse, error) {
+	msg, err := wa.getMessageForDirectMedia(ctx, parsedID)
+	if err != nil {
+		return nil, err
 	} else if msg == nil {
 		return nil, fmt.Errorf("message not found")
 	}

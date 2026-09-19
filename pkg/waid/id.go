@@ -83,11 +83,18 @@ func MakeMessageID(chat, sender types.JID, id types.MessageID) networkid.Message
 	return networkid.MessageID(fmt.Sprintf("%s:%s:%s", chat.ToNonAD().String(), sender.ToNonAD().String(), id))
 }
 
-func MakeMessageIDWithAltSender(chat, sender, altSender types.JID, id types.MessageID) networkid.MessageID {
+// IDSender returns the sender JID that message and media IDs must be built with.
+// Chats addressed by LID always store the LID form of the sender, even when the message
+// source only has the phone number (e.g. own messages parsed from history sync).
+func IDSender(chat, sender, altSender types.JID) types.JID {
 	if chat.Server == types.HiddenUserServer && sender.Server == types.DefaultUserServer && altSender.Server == types.HiddenUserServer {
-		sender = altSender
+		return altSender
 	}
-	return MakeMessageID(chat, sender, id)
+	return sender
+}
+
+func MakeMessageIDWithAltSender(chat, sender, altSender types.JID, id types.MessageID) networkid.MessageID {
+	return MakeMessageID(chat, IDSender(chat, sender, altSender), id)
 }
 
 func MakeFakeMessageID(chat, sender types.JID, data string) networkid.MessageID {
