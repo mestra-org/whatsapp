@@ -136,6 +136,9 @@ func (evt *WAMessageEvent) AddLogContext(c zerolog.Context) zerolog.Context {
 	if targetMsg := evt.GetTargetMessage(); targetMsg != "" {
 		c = c.Str("target_message_id", string(targetMsg))
 	}
+	if evt.parsedMessageType == "edit" {
+		c = c.Str("edit_inner_message_type", getMessageType(evt.Message.GetProtocolMessage().GetEditedMessage()))
+	}
 	return evt.MessageInfoWrapper.AddLogContext(c).Str("parsed_message_type", evt.parsedMessageType)
 }
 
@@ -189,18 +192,49 @@ func (evt *WAMessageEvent) ConvertEdit(ctx context.Context, portal *bridgev2.Por
 		cacheMessage = evt.GetID()
 	} else {
 		editedMsg = evt.Message.GetProtocolMessage().GetEditedMessage()
-		previouslyConvertedPart = evt.wa.Main.GetMediaEditCache(portal, targetMessage)
+		if editedMsg.GetLottieStickerMessage().GetMessage() != nil {
+			editedMsg = editedMsg.GetLottieStickerMessage().GetMessage()
+		}
+		if editedMsg.GetDocumentWithCaptionMessage().GetMessage() != nil {
+			editedMsg = editedMsg.GetDocumentWithCaptionMessage().GetMessage()
+		}
 		meta := existing[0].Metadata.(*waid.MessageMetadata)
 		if slices.Contains(meta.Edits, evt.Info.ID) {
 			return nil, fmt.Errorf("%w: edit already handled", bridgev2.ErrIgnoringRemoteEvent)
 		}
 		meta.Edits = append(meta.Edits, evt.Info.ID)
+		previouslyConvertedPart = evt.wa.Main.GetMediaEditCache(portal, targetMessage)
+		if previouslyConvertedPart == nil && needsPreviousEditPart(editedMsg) {
+			editedEvent, err := evt.wa.Main.Bridge.Bot.GetEvent(ctx, portal.MXID, existing[0].MXID)
+			if err != nil {
+				zerolog.Ctx(ctx).Err(err).Msg("Failed to fetch existing event for edit")
+			} else if editedEvent != nil && editedEvent.Content.AsMessage().MsgType != "" {
+				zerolog.Ctx(ctx).Debug().Msg("Fetched existing edit from server for caption edit")
+				copiedExtra := make(map[string]any)
+				for _, key := range []string{"info", msgconv.FailedMediaField} {
+					val, ok := editedEvent.Content.Raw[key]
+					if ok {
+						copiedExtra[key] = val
+					}
+				}
+				previouslyConvertedPart = &bridgev2.ConvertedMessagePart{
+					ID:         existing[0].PartID,
+					Type:       editedEvent.Type,
+					Content:    editedEvent.Content.AsMessage(),
+					Extra:      copiedExtra,
+					DBMetadata: meta,
+				}
+			} else {
+				zerolog.Ctx(ctx).Debug().Msg("Didn't find existing edit on server for caption edit")
+			}
+		}
 	}
 
 	ctx = context.WithValue(ctx, msgconv.ContextKeyEditTargetID, evt.Message.GetProtocolMessage().GetKey().GetID())
 	cm := evt.wa.Main.MsgConv.ToMatrix(
 		ctx, portal, evt.wa.Client, intent, editedMsg, evt.MsgEvent.RawMessage, &evt.Info, evt.isViewOnce(), false, previouslyConvertedPart,
 	)
+	evt.addMuseProfile(portal, cm)
 	if evt.isUndecryptableUpsertSubEvent && isFailedMedia(cm) {
 		evt.postHandle = func() {
 			evt.wa.processFailedMedia(ctx, portal.PortalKey, evt.GetID(), cm, false)
@@ -281,11 +315,30 @@ func (evt *WAMessageEvent) HandleExisting(ctx context.Context, portal *bridgev2.
 	return bridgev2.UpsertResult{}, nil
 }
 
+func (evt *WAMessageEvent) addMuseProfile(portal *bridgev2.Portal, converted *bridgev2.ConvertedMessage) {
+	if evt.Info.Chat != types.MuseJID || evt.Info.IsFromMe || !portal.NameIsCustom {
+		return
+	}
+	profile := &event.BeeperPerMessageProfile{
+		ID:          string(portal.MXID),
+		Displayname: portal.Name,
+	}
+	if portal.AvatarMXC != "" {
+		profile.AvatarURL = &portal.AvatarMXC
+	}
+	for _, part := range converted.Parts {
+		if part.Content != nil {
+			part.Content.BeeperPerMessageProfile = profile
+		}
+	}
+}
+
 func (evt *WAMessageEvent) ConvertMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI) (*bridgev2.ConvertedMessage, error) {
 	evt.wa.EnqueuePortalResync(portal, false)
 	converted := evt.wa.Main.MsgConv.ToMatrix(
 		ctx, portal, evt.wa.Client, intent, evt.Message, evt.MsgEvent.RawMessage, &evt.Info, evt.isViewOnce(), false, nil,
 	)
+	evt.addMuseProfile(portal, converted)
 	if isFailedMedia(converted) {
 		evt.postHandle = func() {
 			evt.wa.processFailedMedia(ctx, portal.PortalKey, evt.GetID(), converted, false)
@@ -315,7 +368,10 @@ func (evt *WANowDecryptableMessage) GetTargetMessage() networkid.MessageID {
 }
 
 func (evt *WANowDecryptableMessage) AddLogContext(c zerolog.Context) zerolog.Context {
-	return c
+	if evt.editParts != nil {
+		return c.Bool("from_upsert", true)
+	}
+	return evt.WAMessageEvent.AddLogContext(c.Bool("from_upsert", false))
 }
 
 func (evt *WANowDecryptableMessage) GetType() bridgev2.RemoteEventType {
@@ -413,19 +469,7 @@ func (evt *WAMediaRetry) AddLogContext(c zerolog.Context) zerolog.Context {
 }
 
 func (evt *WAMediaRetry) getRealSender() types.JID {
-	sender := evt.SenderID
-	if sender.IsEmpty() {
-		if evt.FromMe {
-			if evt.ChatID.Server == types.HiddenUserServer {
-				sender = evt.wa.GetLID().ToNonAD()
-			} else {
-				sender = evt.wa.JID.ToNonAD()
-			}
-		} else if evt.ChatID.Server == types.DefaultUserServer || evt.ChatID.Server == types.HiddenUserServer || evt.ChatID.Server == types.BotServer {
-			sender = evt.ChatID.ToNonAD()
-		}
-	}
-	return sender
+	return evt.wa.getRealSender(evt.ChatID, evt.SenderID, evt.FromMe)
 }
 
 func (evt *WAMediaRetry) GetSender() bridgev2.EventSender {
@@ -495,6 +539,7 @@ func (evt *WAMediaRetry) ConvertEdit(ctx context.Context, portal *bridgev2.Porta
 			log.Debug().Msg("Got error response in media retry notification, but response also contains a new download URL - trying to download")
 		}
 	}
+	log.Trace().Any("retry_content", retryData).Msg("Decrypted successful media retry response")
 	err = evt.wa.mediaRetryLock.Acquire(ctx, 1)
 	if err != nil {
 		return nil, fmt.Errorf("failed to acquire media retry lock: %w", err)

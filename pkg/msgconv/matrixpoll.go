@@ -71,7 +71,7 @@ func (mc *MessageConverter) PollStartToWhatsApp(
 	if maxAnswers >= len(content.PollStart.Answers) || maxAnswers < 0 {
 		maxAnswers = 0
 	}
-	contextInfo := mc.generateContextInfo(ctx, replyTo, portal, nil, content.Mentions != nil && content.Mentions.Room)
+	contextInfo := mc.generateContextInfo(ctx, replyTo, content.RelatesTo, portal, nil, content.Mentions != nil && content.Mentions.Room)
 	var question string
 	question, contextInfo.MentionedJID = mc.msc1767ToWhatsApp(ctx, content.PollStart.Question, content.Mentions)
 	if len(question) == 0 {
@@ -150,8 +150,8 @@ func MessageIDToInfo(ctx context.Context, client *whatsmeow.Client, parsedMsgID 
 	chat := parsedMsgID.Chat
 	sender := parsedMsgID.Sender
 	if chat.Server == types.DefaultUserServer {
-		chatLID, _ := client.Store.LIDs.GetLIDForPN(ctx, chat)
-		senderLID, _ := client.Store.LIDs.GetLIDForPN(ctx, sender)
+		chatLID, _ := getStore(client).LIDs.GetLIDForPN(ctx, chat)
+		senderLID, _ := getStore(client).LIDs.GetLIDForPN(ctx, sender)
 		if !chatLID.IsEmpty() && !senderLID.IsEmpty() {
 			chat = chatLID
 			sender = senderLID
@@ -161,7 +161,7 @@ func MessageIDToInfo(ctx context.Context, client *whatsmeow.Client, parsedMsgID 
 		MessageSource: types.MessageSource{
 			Chat:     chat,
 			Sender:   sender,
-			IsFromMe: sender.User == client.Store.GetLID().User || sender.User == client.Store.GetJID().User,
+			IsFromMe: sender.User == getStore(client).GetLID().User || sender.User == getStore(client).GetJID().User,
 			IsGroup:  chat.Server == types.GroupServer,
 		},
 		ID: parsedMsgID.ID,
