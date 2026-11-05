@@ -212,31 +212,41 @@ func (wa *WhatsAppClient) getContactList(ctx context.Context, filter string, onl
 	if err != nil {
 		return nil, err
 	}
+	// People the user has a one-to-one chat with are listed even when they aren't in the phone's
+	// address book. Clients find a chat's contact (phone number, photo) in this list by DM room,
+	// so without them most chats would have no contact details.
+	dmPartners, err := wa.getDMPartners(ctx)
+	if err != nil {
+		return nil, err
+	}
 	resp := make([]*bridgev2.ResolveIdentifierResponse, 0, len(contacts))
 	addedIDs := make(exmaps.Set[types.JID])
-	for jid, contactInfo := range contacts {
-		if onlyContacts && (contactInfo.FirstName == "" && contactInfo.FullName == "") {
-			continue
-		}
+	add := func(jid types.JID, contactInfo types.ContactInfo) error {
 		if !matchesQuery(contactInfo.PushName, filter) && !matchesQuery(contactInfo.FullName, filter) && !matchesQuery(jid.User, filter) {
-			continue
+			return nil
 		}
+		portalKey, hasDM := dmPartners[jid]
 		var lid types.JID
 		if jid.Server == types.HiddenUserServer {
 			lid = jid
 		} else if jid.Server == types.DefaultUserServer {
 			lid, err = wa.GetStore().LIDs.GetLIDForPN(ctx, jid)
 			if err != nil {
-				return nil, fmt.Errorf("failed to get lid for phone number %s: %w", jid, err)
+				return fmt.Errorf("failed to get lid for phone number %s: %w", jid, err)
 			} else if !lid.IsEmpty() {
 				jid = lid
 			}
 		}
 		if !addedIDs.Add(jid) {
-			continue
+			return nil
+		}
+		if lidKey, ok := dmPartners[lid]; ok && !lid.IsEmpty() {
+			portalKey, hasDM = lidKey, true
 		}
 		var chatResp *bridgev2.CreateChatResponse
-		if !lid.IsEmpty() {
+		if hasDM {
+			chatResp = &bridgev2.CreateChatResponse{PortalKey: portalKey}
+		} else if !lid.IsEmpty() {
 			chatResp = &bridgev2.CreateChatResponse{PortalKey: wa.makeWAPortalKey(lid)}
 		}
 		ghost, _ := wa.Main.Bridge.GetGhostByID(ctx, waid.MakeUserID(jid))
@@ -246,9 +256,47 @@ func (wa *WhatsAppClient) getContactList(ctx context.Context, filter string, onl
 			UserInfo: wa.contactToUserInfo(ctx, jid, contactInfo, "", false),
 			Chat:     chatResp,
 		})
+		return nil
+	}
+	for jid, contactInfo := range contacts {
+		inAddressBook := contactInfo.FirstName != "" || contactInfo.FullName != ""
+		if _, hasDM := dmPartners[jid]; onlyContacts && !inAddressBook && !hasDM {
+			continue
+		}
+		if err = add(jid, contactInfo); err != nil {
+			return nil, err
+		}
+	}
+	// DM partners the contact store knows nothing about still get an entry; contactToUserInfo
+	// finds their phone number through the LID mapping.
+	for jid := range dmPartners {
+		if addedIDs.Has(jid) {
+			continue
+		}
+		if err = add(jid, types.ContactInfo{}); err != nil {
+			return nil, err
+		}
 	}
 	wa.syncContactGhosts(ctx, resp)
 	return resp, nil
+}
+
+// getDMPartners returns the users this login has a one-to-one chat portal with, keyed by the JID
+// in the portal ID (a LID for chats migrated to LIDs, otherwise a phone number JID).
+func (wa *WhatsAppClient) getDMPartners(ctx context.Context) (map[types.JID]networkid.PortalKey, error) {
+	userPortals, err := wa.Main.Bridge.DB.UserPortal.GetAllForLogin(ctx, wa.UserLogin.UserLogin)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get portals of login: %w", err)
+	}
+	partners := make(map[types.JID]networkid.PortalKey)
+	for _, up := range userPortals {
+		jid, err := waid.ParsePortalID(up.Portal.ID)
+		if err != nil || (jid.Server != types.HiddenUserServer && jid.Server != types.DefaultUserServer) || wa.IsOwnJID(jid) {
+			continue
+		}
+		partners[jid] = up.Portal
+	}
+	return partners, nil
 }
 
 func (wa *WhatsAppClient) CreateGroup(ctx context.Context, params *bridgev2.GroupCreateParams) (*bridgev2.CreateChatResponse, error) {
