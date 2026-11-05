@@ -165,7 +165,8 @@ func (wa *WhatsAppClient) doGhostResync(ctx context.Context, queue map[types.JID
 			log.Warn().Stringer("jid", jid).Msg("Didn't get info for puppet in background sync")
 			continue
 		}
-		userInfo, err := wa.getUserInfo(ctx, jid, info.PictureID, info.PictureID != "" && string(ghost.AvatarID) != info.PictureID)
+		fetchAvatar := (info.PictureID != "" && string(ghost.AvatarID) != info.PictureID) || ghostNeedsAvatar(ghost)
+		userInfo, err := wa.getUserInfo(ctx, jid, info.PictureID, fetchAvatar)
 		if err != nil {
 			log.Err(err).Stringer("jid", jid).Msg("Failed to get user info for puppet in background sync")
 			continue
@@ -176,12 +177,13 @@ func (wa *WhatsAppClient) doGhostResync(ctx context.Context, queue map[types.JID
 }
 
 func (wa *WhatsAppClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*bridgev2.UserInfo, error) {
-	if ghost.Name != "" && ghost.NameSet && ghost.AvatarID != "" {
+	needsAvatar := ghostNeedsAvatar(ghost)
+	if ghost.Name != "" && ghost.NameSet && !needsAvatar {
 		wa.EnqueueGhostResync(ghost)
 		return nil, nil
 	}
 	jid := waid.ParseUserID(ghost.ID)
-	return wa.getUserInfo(ctx, jid, "", ghost.AvatarID == "")
+	return wa.getUserInfo(ctx, jid, "", needsAvatar)
 }
 
 func (wa *WhatsAppClient) getUserInfo(ctx context.Context, jid types.JID, avatarID string, fetchAvatar bool) (*bridgev2.UserInfo, error) {
@@ -360,10 +362,26 @@ func (wa *WhatsAppClient) makeLazyGhostAvatarUpdater(avatarID string, forceUpdat
 	}
 }
 
+// fetchGhostAvatar is the ExtraUpdates form of updateGhostAvatar. When the fetch fails, the ghost
+// is flagged for another try and queued for the background repair (see ghostrepair.go), because
+// bridgev2 has already marked its avatar as set and wouldn't ask again.
 func (wa *WhatsAppClient) fetchGhostAvatar(ctx context.Context, ghost *bridgev2.Ghost) bool {
+	changed, err := wa.updateGhostAvatar(ctx, ghost)
+	if err != nil {
+		zerolog.Ctx(ctx).Err(err).Str("ghost_id", string(ghost.ID)).Msg("Failed to get avatar info")
+		if ghost.AvatarMXC == "" {
+			wa.queueGhostRepair(waid.ParseUserID(ghost.ID))
+		}
+		return allowAvatarRetry(ghost) || changed
+	}
+	return changed
+}
+
+func (wa *WhatsAppClient) updateGhostAvatar(ctx context.Context, ghost *bridgev2.Ghost) (bool, error) {
 	jid := waid.ParseUserID(ghost.ID)
 	existingID := string(ghost.AvatarID)
-	if existingID == "remove" || existingID == "unauthorized" {
+	if ghostNeedsAvatar(ghost) {
+		// Don't let WhatsApp answer "unchanged" for an ID whose picture never made it to Matrix.
 		existingID = ""
 	}
 	var wrappedAvatar *bridgev2.Avatar
@@ -379,15 +397,13 @@ func (wa *WhatsAppClient) fetchGhostAvatar(ctx context.Context, ghost *bridgev2.
 			Remove: true,
 		}
 	} else if err != nil {
-		zerolog.Ctx(ctx).Err(err).Msg("Failed to get avatar info")
-		return false
+		return false, err
 	} else if avatar == nil {
-		return false
+		return false, nil
 	} else if wa.Main.MsgConv.DirectMedia {
 		wrappedAvatar, err = wa.makeDirectMediaAvatar(ctx, jid, avatar, false)
 		if err != nil {
-			zerolog.Ctx(ctx).Err(err).Msg("Failed to prepare direct media avatar")
-			return false
+			return false, fmt.Errorf("failed to prepare direct media avatar: %w", err)
 		}
 	} else {
 		wrappedAvatar = &bridgev2.Avatar{
@@ -397,7 +413,7 @@ func (wa *WhatsAppClient) fetchGhostAvatar(ctx context.Context, ghost *bridgev2.
 			},
 		}
 	}
-	return ghost.UpdateAvatar(ctx, wrappedAvatar)
+	return ghost.UpdateAvatar(ctx, wrappedAvatar), nil
 }
 
 func (wa *WhatsAppClient) resyncContacts(forceAvatarSync, automatic bool) {
@@ -431,7 +447,7 @@ func (wa *WhatsAppClient) resyncContacts(forceAvatarSync, automatic bool) {
 		} else if contact, err := contactStore.GetContact(ctx, jid); err != nil {
 			log.Err(err).Stringer("jid", jid).Msg("Failed to get contact info")
 		} else {
-			userInfo := wa.contactToUserInfo(ctx, jid, contact, "", forceAvatarSync || ghost.AvatarID == "")
+			userInfo := wa.contactToUserInfo(ctx, jid, contact, "", forceAvatarSync || ghostNeedsAvatar(ghost))
 			ghost.UpdateInfo(ctx, userInfo)
 			wa.syncAltGhostWithInfo(ctx, jid, ghost)
 		}
@@ -464,11 +480,11 @@ func (wa *WhatsAppClient) syncAltGhostWithInfo(ctx context.Context, jid types.JI
 		return
 	}
 	info := makeInfoFromGhost(mainGhost)
-	if mainGhost.AvatarID == "" {
+	if ghostNeedsAvatar(mainGhost) {
 		// The main ghost's avatar is unknown (never fetched or the fetch failed), so don't clear
 		// the alternate ghost's avatar, and fetch it directly if it doesn't have one either.
 		info.Avatar = nil
-		if ghost.AvatarID == "" {
+		if ghostNeedsAvatar(ghost) {
 			info.ExtraUpdates = wa.fetchGhostAvatar
 		}
 	}

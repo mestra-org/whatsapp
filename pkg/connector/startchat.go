@@ -247,6 +247,7 @@ func (wa *WhatsAppClient) getContactList(ctx context.Context, filter string, onl
 			Chat:     chatResp,
 		})
 	}
+	wa.syncContactGhosts(ctx, resp)
 	return resp, nil
 }
 

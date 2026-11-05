@@ -117,6 +117,7 @@ type WhatsAppClient struct {
 	directMediaRetries map[networkid.MessageID]*directMediaRetry
 	directMediaLock    sync.Mutex
 	avatarLock         exsync.KeyedMutex[types.JID]
+	ghostRepair        ghostRepairQueue
 	mediaRetryLock     *semaphore.Weighted
 	offlineSyncWaiter  atomic.Pointer[chan error]
 	isNewLogin         bool
