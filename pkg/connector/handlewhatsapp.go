@@ -176,6 +176,7 @@ func (wa *WhatsAppClient) handleWAEvent(rawEvt any) (success bool) {
 	case *events.Connected:
 		log.Debug().Msg("Connected to WhatsApp socket")
 		wa.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
+		go wa.startGhostRepairSweep()
 		if wa.offlineSyncWaiter.Load() == nil {
 			go func() {
 				wa.resyncWASARootSecrets(ctx)
