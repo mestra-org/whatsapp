@@ -53,6 +53,7 @@ import (
 func (mc *MessageConverter) generateContextInfo(
 	ctx context.Context,
 	replyTo *database.Message,
+	relatesTo *event.RelatesTo,
 	portal *bridgev2.Portal,
 	perMessageTimer *event.BeeperDisappearingTimer,
 	roomMention bool,
@@ -63,7 +64,7 @@ func (mc *MessageConverter) generateContextInfo(
 		if err == nil {
 			contextInfo.StanzaID = proto.String(msgID.ID)
 			contextInfo.Participant = proto.String(msgID.Sender.String())
-			contextInfo.QuotedMessage = &waE2E.Message{Conversation: proto.String("")}
+			contextInfo.QuotedMessage = mc.getQuotedMessage(ctx, replyTo, relatesTo, portal)
 			contextInfo.QuotedType = waE2E.ContextInfo_EXPLICIT.Enum()
 		} else {
 			zerolog.Ctx(ctx).Warn().Err(err).
@@ -91,6 +92,37 @@ func (mc *MessageConverter) generateContextInfo(
 	return contextInfo
 }
 
+func (mc *MessageConverter) getQuotedMessage(ctx context.Context, replyTo *database.Message, relatesTo *event.RelatesTo, portal *bridgev2.Portal) *waE2E.Message {
+	log := zerolog.Ctx(ctx).With().Stringer("reply_to_event_id", replyTo.MXID).Logger()
+	if relatesTo.GetReplyTo() == replyTo.MXID && len(relatesTo.InReplyTo.BeeperQuote) > 0 {
+		var content event.MessageEventContent
+		if err := json.Unmarshal(relatesTo.InReplyTo.BeeperQuote, &content); err != nil {
+			log.Warn().Err(err).Msg("Failed to parse quoted event content")
+		} else {
+			return mc.convertQuote(ctx, content)
+		}
+	}
+	evt, err := mc.Bridge.Bot.GetEvent(ctx, portal.MXID, replyTo.MXID)
+	if err != nil {
+		log.Debug().Err(err).Msg("Failed to fetch quoted event")
+	} else if evt == nil {
+		log.Debug().Msg("Quoted event not found")
+	} else if evt.RoomID != "" && evt.RoomID != portal.MXID {
+		log.Warn().Msg("Quoted event is in a different room")
+	} else if evt.Unsigned.RedactedBecause == nil {
+		return mc.convertQuote(ctx, *evt.Content.AsMessage())
+	}
+	return &waE2E.Message{Conversation: new("")}
+}
+
+func (mc *MessageConverter) convertQuote(ctx context.Context, content event.MessageEventContent) *waE2E.Message {
+	content.Mentions = &event.Mentions{}
+	content.RemoveReplyFallback()
+	content.RemovePerMessageProfileFallback()
+	text, _ := mc.parseText(ctx, &content)
+	return &waE2E.Message{Conversation: &text}
+}
+
 func (mc *MessageConverter) ToWhatsApp(
 	ctx context.Context,
 	client *whatsmeow.Client,
@@ -107,7 +139,7 @@ func (mc *MessageConverter) ToWhatsApp(
 	}
 
 	message := &waE2E.Message{}
-	contextInfo := mc.generateContextInfo(ctx, replyTo, portal, content.BeeperDisappearingTimer, content.Mentions != nil && content.Mentions.Room)
+	contextInfo := mc.generateContextInfo(ctx, replyTo, content.RelatesTo, portal, content.BeeperDisappearingTimer, content.Mentions != nil && content.Mentions.Room)
 
 	switch content.MsgType {
 	case event.MsgText, event.MsgNotice, event.MsgEmote:
@@ -150,7 +182,7 @@ func (mc *MessageConverter) ToWhatsApp(
 			}
 			lid := parsedID.Sender
 			if lid.Server == types.DefaultUserServer {
-				lid, err = client.Store.LIDs.GetLIDForPN(ctx, lid)
+				lid, err = getStore(client).LIDs.GetLIDForPN(ctx, lid)
 				if err != nil {
 					return nil, nil, fmt.Errorf("failed to get LID for PN: %w", err)
 				}
@@ -161,7 +193,6 @@ func (mc *MessageConverter) ToWhatsApp(
 				DeprecatedLIDSession:   ptr.Ptr(false),
 			}
 		} else {
-			// TODO check permissions?
 			message.MessageContextInfo = &waE2E.MessageContextInfo{
 				MessageSecret: random.Bytes(32),
 			}
@@ -585,7 +616,7 @@ func (mc *MessageConverter) reuploadFileToWhatsApp(
 				sourceFormat = "mov"
 			}
 			data, err = ffmpeg.ConvertBytes(ctx, data, ".mp4", []string{"-f", sourceFormat}, []string{
-				"-pix_fmt", "yuv420p", "-c:v", "libx264",
+				"-pix_fmt", "yuv420p", "-c:v", "h264", "-b:v", "2M",
 				"-filter:v", "crop='floor(in_w/2)*2:floor(in_h/2)*2'",
 			}, mime)
 			if err != nil {
@@ -594,7 +625,7 @@ func (mc *MessageConverter) reuploadFileToWhatsApp(
 			mime = "video/mp4"
 		case "image/gif":
 			data, err = ffmpeg.ConvertBytes(ctx, data, ".mp4", []string{"-f", "gif"}, []string{
-				"-pix_fmt", "yuv420p", "-c:v", "libx264", "-movflags", "+faststart",
+				"-pix_fmt", "yuv420p", "-c:v", "h264", "-b:v", "2M", "-movflags", "+faststart",
 				"-filter:v", "crop='floor(in_w/2)*2:floor(in_h/2)*2'",
 			}, mime)
 			if err != nil {

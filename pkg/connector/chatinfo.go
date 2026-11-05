@@ -10,6 +10,7 @@ import (
 	"go.mau.fi/util/jsontime"
 	"go.mau.fi/util/ptr"
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/appstate"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	"maunium.net/go/mautrix/bridgev2"
@@ -35,6 +36,9 @@ func (wa *WhatsAppClient) getChatInfo(ctx context.Context, portalJID types.JID, 
 	switch portalJID.Server {
 	case types.DefaultUserServer, types.HiddenUserServer, types.BotServer:
 		wrapped = wa.wrapDMInfo(ctx, portalJID)
+		if portalJID == types.MuseJID {
+			go wa.requestMuseProfile(ctx)
+		}
 	case types.BroadcastServer:
 		if portalJID == types.StatusBroadcastJID {
 			wrapped = wa.wrapStatusBroadcastInfo(ctx)
@@ -113,9 +117,16 @@ func (wa *WhatsAppClient) applyChatSettings(ctx context.Context, chatID types.JI
 			return
 		}
 	}
-	info.UserLocal = &bridgev2.UserLocalPortalInfo{
-		MutedUntil: ptr.Ptr(chat.MutedUntil),
+	wa.appStateRecoveryLock.Lock()
+	_, muteStateBroken := wa.UserLogin.Metadata.(*waid.UserLoginMetadata).AppStateRecoveryAttempted[appstate.WAPatchRegularHigh]
+	wa.appStateRecoveryLock.Unlock()
+	userLocal := &bridgev2.UserLocalPortalInfo{}
+	if !muteStateBroken {
+		userLocal.MutedUntil = ptr.Ptr(chat.MutedUntil)
+	} else if info.UserLocal != nil {
+		userLocal.MutedUntil = info.UserLocal.MutedUntil
 	}
+	info.UserLocal = userLocal
 	if chat.Pinned {
 		info.UserLocal.Tag = ptr.Ptr(wa.Main.Config.PinnedTag)
 	} else if chat.Archived {
@@ -181,6 +192,11 @@ func (wa *WhatsAppClient) wrapDMInfo(ctx context.Context, jid types.JID) *bridge
 			ExcludeChangesFromTimeline: true,
 		},
 		ExcludeChangesFromTimeline: true,
+	}
+	var err error
+	info.UserBlocked, err = wa.isUserBlocked(ctx, jid)
+	if err != nil {
+		zerolog.Ctx(ctx).Warn().Err(err).Msg("Failed to get blocked state")
 	}
 	if jid.Server == types.BotServer {
 		info.Topic = ptr.Ptr(BotChatTopic)
@@ -260,6 +276,8 @@ func setTopicID(id, topic string) bridgev2.ExtraUpdater[*bridgev2.Portal] {
 
 func (wa *WhatsAppClient) wrapGroupInfo(ctx context.Context, info *types.GroupInfo) *bridgev2.ChatInfo {
 	sendEventPL := defaultPL
+	// Community announcement groups allow non-admins to send threaded replies.
+	// Power levels can't represent that, but the power level is checked separately when handling messages.
 	if info.IsAnnounce && !info.IsDefaultSubGroup {
 		sendEventPL = adminPL
 	}
@@ -290,6 +308,7 @@ func (wa *WhatsAppClient) wrapGroupInfo(ctx context.Context, info *types.GroupIn
 					event.StateRoomName:                metaChangePL,
 					event.StateRoomAvatar:              metaChangePL,
 					event.StateTopic:                   metaChangePL,
+					event.EventEncrypted:               defaultPL, // Need to always allow encrypted events for poll responses
 					event.EventReaction:                defaultPL,
 					event.EventRedaction:               defaultPL,
 					event.EventUnstablePollResponse:    defaultPL,
@@ -556,15 +575,32 @@ func (wa *WhatsAppClient) wrapNewsletterInfo(ctx context.Context, info *types.Ne
 				StateDefault:  ptr.Ptr(nobodyPL),
 				Ban:           ptr.Ptr(nobodyPL),
 				Events: map[event.Type]int{
-					event.StateRoomName:             adminPL,
-					event.StateRoomAvatar:           adminPL,
-					event.StateTopic:                adminPL,
-					event.EventReaction:             defaultPL,
-					event.EventRedaction:            defaultPL,
-					event.EventUnstablePollResponse: defaultPL,
+					event.StateRoomName:   adminPL,
+					event.StateRoomAvatar: adminPL,
+					event.StateTopic:      adminPL,
+					event.EventReaction:   defaultPL,
+					event.EventRedaction:  defaultPL,
+					// TODO support poll votes in channels
+					//event.EventUnstablePollResponse: defaultPL,
 				},
 			},
 		},
 		Type: ptr.Ptr(database.RoomTypeDefault),
 	}
+}
+
+func (wa *WhatsAppClient) isUserBlocked(ctx context.Context, jid types.JID) (*bool, error) {
+	wa.blocklistLock.Lock()
+	defer wa.blocklistLock.Unlock()
+	meta := wa.UserLogin.Metadata.(*waid.UserLoginMetadata)
+	blocklist := meta.Blocklist
+	if blocklist == nil {
+		runHandlers := wa.resyncBlocklistUnlocked(ctx)
+		go runHandlers()
+		blocklist = meta.Blocklist
+	}
+	if blocklist == nil {
+		return nil, nil
+	}
+	return new(blocklist.IsBlocked(jid)), nil
 }

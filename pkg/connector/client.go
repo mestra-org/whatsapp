@@ -122,11 +122,16 @@ type WhatsAppClient struct {
 	isNewLogin         bool
 	pushNamesSynced    *exsync.Event
 	lastPresence       types.Presence
+	blocklistLock      sync.Mutex
 
 	disableNewsletter bool
 
 	appStateRecoveryLock      sync.Mutex
 	appStateFullSyncAttempted map[appstate.WAPatchName]time.Time
+
+	wasaResyncLock         sync.Mutex
+	museProfileLock        sync.Mutex
+	lastMuseProfileRequest time.Time
 }
 
 var (
@@ -206,13 +211,17 @@ func (wa *WhatsAppClient) GetLID() types.JID {
 }
 
 func (wa *WhatsAppClient) Connect(ctx context.Context) {
+	wa.connect(ctx)
+}
+
+func (wa *WhatsAppClient) connect(ctx context.Context) bool {
 	if wa.Client == nil {
 		state := status.BridgeState{
 			StateEvent: status.StateBadCredentials,
 			Error:      WANotLoggedIn,
 		}
 		wa.UserLogin.BridgeState.Send(state)
-		return
+		return false
 	}
 	wa.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnecting})
 	wa.Main.firstClientConnectOnce.Do(wa.Main.onFirstClientConnect)
@@ -220,7 +229,7 @@ func (wa *WhatsAppClient) Connect(ctx context.Context) {
 		zerolog.Ctx(ctx).Err(err).Msg("Failed to update proxy")
 	}
 	if ctx.Err() != nil {
-		return
+		return false
 	}
 	wa.initMC()
 	wa.startLoops()
@@ -237,7 +246,9 @@ func (wa *WhatsAppClient) Connect(ctx context.Context) {
 			},
 		}
 		wa.UserLogin.BridgeState.Send(state)
+		return false
 	}
+	return true
 }
 
 func (wa *WhatsAppClient) notifyOfflineSyncWaiter(err error) {
@@ -452,6 +463,10 @@ func (wa *WhatsAppClient) HandleMatrixViewingChat(ctx context.Context, msg *brid
 		if err != nil {
 			zerolog.Ctx(ctx).Warn().Err(err).Msg("Failed to set presence when viewing chat")
 		}
+	}
+
+	if msg.Portal != nil && msg.Portal.ID == waid.MakePortalID(types.MuseJID) {
+		go wa.requestMuseProfile(ctx)
 	}
 
 	if msg.Portal == nil || msg.Portal.Metadata.(*waid.PortalMetadata).LastSync.Add(5*time.Minute).After(time.Now()) {

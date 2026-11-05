@@ -13,6 +13,7 @@ import (
 	"github.com/rs/zerolog"
 	"go.mau.fi/util/exsync"
 	"go.mau.fi/util/jsontime"
+	"go.mau.fi/util/ptr"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -402,6 +403,7 @@ func (wl *WALogin) onLoginComplete(ctx context.Context) (*bridgev2.LoginStep, er
 			Timezone:   wl.Timezone,
 
 			HistorySyncPortalsNeedCreating: true,
+			WASAResynced:                   true,
 		},
 	}, &bridgev2.NewLoginParams{
 		DeleteOnConflict: true,
@@ -410,8 +412,15 @@ func (wl *WALogin) onLoginComplete(ctx context.Context) (*bridgev2.LoginStep, er
 		return nil, fmt.Errorf("failed to create user login: %w", err)
 	}
 
-	ul.Client.(*WhatsAppClient).isNewLogin = true
-	ul.Client.Connect(ul.Log.WithContext(wl.Main.Bridge.BackgroundCtx))
+	c := ul.Client.(*WhatsAppClient)
+	c.isNewLogin = true
+	if c.connect(ul.Log.WithContext(wl.Main.Bridge.BackgroundCtx)) {
+		err = c.Client.PreKeysUploaded.WaitTimeoutCtx(ctx, 5*time.Second)
+		if err != nil {
+			wl.Log.Warn().Err(err).Msg("Prekey upload wait failed")
+		}
+		go c.syncGhost(c.JID.ToNonAD(), "login", ptr.Ptr(""))
+	}
 
 	return &bridgev2.LoginStep{
 		Type:         bridgev2.LoginStepTypeComplete,
