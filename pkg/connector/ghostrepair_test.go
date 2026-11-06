@@ -2,13 +2,17 @@ package connector
 
 import (
 	"testing"
+	"time"
 
+	"go.mau.fi/util/jsontime"
 	"go.mau.fi/util/ptr"
 	"go.mau.fi/whatsmeow/types"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/id"
+
+	"go.mau.fi/mautrix-whatsapp/pkg/waid"
 )
 
 func testGhost(name string, nameSet bool, avatarID, mxc string, avatarSet bool, identifiers ...string) *bridgev2.Ghost {
@@ -121,11 +125,62 @@ func TestGhostRepairQueue(t *testing.T) {
 	wa.queueGhostRepair(b)
 	jid, _ := wa.nextGhostRepair()
 	before := wa.ghostRepair.attempts[b]
-	wa.requeueGhostRepair(jid)
+	wa.requeueGhostRepair(jid, false)
 	if wa.ghostRepair.attempts[b] != before-1 {
 		t.Errorf("requeue should refund the attempt")
 	}
 	if jid, ok := wa.nextGhostRepair(); !ok || jid != b {
 		t.Errorf("requeued ghost should come back next, got %v %v", jid, ok)
+	}
+}
+
+func TestNoAvatarAnswerStale(t *testing.T) {
+	now := time.Now()
+	ghost := func(avatarID string, lastSync time.Time) *bridgev2.Ghost {
+		g := testGhost("A", true, avatarID, "", true)
+		g.Metadata = &waid.GhostMetadata{LastSync: jsontime.U(lastSync)}
+		return g
+	}
+	old := now.Add(-ghostNoAvatarRecheckAge - time.Hour)
+	recent := now.Add(-time.Hour)
+	cases := []struct {
+		name  string
+		ghost *bridgev2.Ghost
+		want  bool
+	}{
+		{"old no-picture answer", ghost("remove", old), true},
+		{"old hidden answer", ghost("unauthorized", old), true},
+		{"never synced hidden answer", ghost("unauthorized", time.Time{}), true},
+		{"recent no-picture answer", ghost("remove", recent), false},
+		{"has a picture", ghost("123", old), false},
+		{"never fetched (handled as missing instead)", ghost("", old), false},
+	}
+	for _, tc := range cases {
+		if got := noAvatarAnswerStale(tc.ghost, now); got != tc.want {
+			t.Errorf("%s: noAvatarAnswerStale = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestGhostRepairQueueRecheck(t *testing.T) {
+	wa := &WhatsAppClient{}
+	wa.ghostRepair.running = true
+	missing := types.NewJID("1", types.HiddenUserServer)
+	stale := types.NewJID("2", types.HiddenUserServer)
+	wa.queueGhostRepair(missing)
+	wa.queueGhostRepairWith(true, stale)
+
+	jid, recheck, _ := wa.nextGhostRepairItem()
+	if jid != missing || recheck {
+		t.Errorf("first = %v recheck=%v, want %v without recheck", jid, recheck, missing)
+	}
+	jid, recheck, _ = wa.nextGhostRepairItem()
+	if jid != stale || !recheck {
+		t.Errorf("second = %v recheck=%v, want %v with recheck", jid, recheck, stale)
+	}
+	wa.ghostRepair.running = true
+	wa.requeueGhostRepair(stale, true)
+	if _, recheck, _ = wa.nextGhostRepairItem(); !recheck {
+		t.Error("a rate-limited recheck should stay a recheck")
 	}
 }

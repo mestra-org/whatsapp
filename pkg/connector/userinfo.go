@@ -366,7 +366,7 @@ func (wa *WhatsAppClient) makeLazyGhostAvatarUpdater(avatarID string, forceUpdat
 // is flagged for another try and queued for the background repair (see ghostrepair.go), because
 // bridgev2 has already marked its avatar as set and wouldn't ask again.
 func (wa *WhatsAppClient) fetchGhostAvatar(ctx context.Context, ghost *bridgev2.Ghost) bool {
-	changed, err := wa.updateGhostAvatar(ctx, ghost)
+	changed, err := wa.updateGhostAvatar(ctx, ghost, false)
 	if err != nil {
 		zerolog.Ctx(ctx).Err(err).Str("ghost_id", string(ghost.ID)).Msg("Failed to get avatar info")
 		if ghost.AvatarMXC == "" {
@@ -377,15 +377,28 @@ func (wa *WhatsAppClient) fetchGhostAvatar(ctx context.Context, ghost *bridgev2.
 	return changed
 }
 
-func (wa *WhatsAppClient) updateGhostAvatar(ctx context.Context, ghost *bridgev2.Ghost) (bool, error) {
+// updateGhostAvatar fetches the ghost's WhatsApp profile picture and sets it. With recheck, the
+// picture is fetched even if WhatsApp would say it hasn't changed.
+func (wa *WhatsAppClient) updateGhostAvatar(ctx context.Context, ghost *bridgev2.Ghost, recheck bool) (bool, error) {
 	jid := waid.ParseUserID(ghost.ID)
 	existingID := string(ghost.AvatarID)
-	if ghostNeedsAvatar(ghost) {
+	if recheck || ghostNeedsAvatar(ghost) {
 		// Don't let WhatsApp answer "unchanged" for an ID whose picture never made it to Matrix.
 		existingID = ""
 	}
 	var wrappedAvatar *bridgev2.Avatar
 	avatar, err := wa.Client.GetProfilePictureInfo(ctx, jid, &whatsmeow.GetProfilePictureParams{ExistingID: existingID})
+	if errors.Is(err, whatsmeow.ErrProfilePictureUnauthorized) && jid.Server == types.HiddenUserServer {
+		// A picture can come back hidden when asked for by LID but not by phone number, so try that
+		// too. The phone number JID is then also the one the media proxy downloads it with.
+		if pn, pnErr := wa.GetStore().LIDs.GetPNForLID(ctx, jid); pnErr == nil && !pn.IsEmpty() {
+			pnAvatar, pnErr := wa.Client.GetProfilePictureInfo(ctx, pn, &whatsmeow.GetProfilePictureParams{ExistingID: existingID})
+			if pnErr == nil || errors.Is(pnErr, whatsmeow.ErrProfilePictureNotSet) {
+				zerolog.Ctx(ctx).Debug().Stringer("lid", jid).Stringer("pn", pn).Msg("Profile picture hidden by LID, used phone number")
+				jid, avatar, err = pn, pnAvatar, pnErr
+			}
+		}
+	}
 	if errors.Is(err, whatsmeow.ErrProfilePictureNotSet) {
 		wrappedAvatar = &bridgev2.Avatar{
 			ID:     "remove",

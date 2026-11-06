@@ -42,6 +42,12 @@ const (
 	// ghostRepairSweepDelay lets the connect-time syncs (history sync, contact resync) finish
 	// before the sweep looks for ghosts that are still missing a photo.
 	ghostRepairSweepDelay = 3 * time.Minute
+	// ghostRepairSweepInterval is how often the sweep runs again while connected.
+	ghostRepairSweepInterval = 24 * time.Hour
+	// ghostNoAvatarRecheckAge is how old a "no picture" or "hidden picture" answer has to be before
+	// the sweep asks WhatsApp again. Picture change events can be missed while the bridge is
+	// disconnected, and bridgev2 never asks again once it has an answer.
+	ghostNoAvatarRecheckAge = 3 * 24 * time.Hour
 
 	// contactSyncWorkers is how many contact list ghosts are synced at once.
 	contactSyncWorkers = 6
@@ -78,6 +84,7 @@ type ghostRepairQueue struct {
 	lock     sync.Mutex
 	order    []types.JID
 	pending  map[types.JID]struct{}
+	recheck  map[types.JID]bool
 	attempts map[types.JID]int
 	running  bool
 	swept    bool
@@ -86,11 +93,18 @@ type ghostRepairQueue struct {
 // queueGhostRepair schedules a background sync of the ghosts' info and profile pictures.
 // Duplicates and ghosts that already failed too often are ignored.
 func (wa *WhatsAppClient) queueGhostRepair(jids ...types.JID) {
+	wa.queueGhostRepairWith(false, jids...)
+}
+
+// queueGhostRepairWith is queueGhostRepair, optionally asking WhatsApp for the picture again even
+// when the ghost already has an answer ("no picture", "hidden").
+func (wa *WhatsAppClient) queueGhostRepairWith(recheck bool, jids ...types.JID) {
 	q := &wa.ghostRepair
 	q.lock.Lock()
 	defer q.lock.Unlock()
 	if q.pending == nil {
 		q.pending = make(map[types.JID]struct{})
+		q.recheck = make(map[types.JID]bool)
 		q.attempts = make(map[types.JID]int)
 	}
 	added := false
@@ -100,6 +114,9 @@ func (wa *WhatsAppClient) queueGhostRepair(jids ...types.JID) {
 			continue
 		}
 		q.pending[jid] = struct{}{}
+		if recheck {
+			q.recheck[jid] = true
+		}
 		q.order = append(q.order, jid)
 		added = true
 	}
@@ -110,28 +127,38 @@ func (wa *WhatsAppClient) queueGhostRepair(jids ...types.JID) {
 }
 
 func (wa *WhatsAppClient) nextGhostRepair() (types.JID, bool) {
+	jid, _, ok := wa.nextGhostRepairItem()
+	return jid, ok
+}
+
+func (wa *WhatsAppClient) nextGhostRepairItem() (jid types.JID, recheck, ok bool) {
 	q := &wa.ghostRepair
 	q.lock.Lock()
 	defer q.lock.Unlock()
 	if len(q.order) == 0 {
 		q.running = false
-		return types.EmptyJID, false
+		return types.EmptyJID, false, false
 	}
-	jid := q.order[0]
+	jid = q.order[0]
 	q.order = slices.Delete(q.order, 0, 1)
 	delete(q.pending, jid)
+	recheck = q.recheck[jid]
+	delete(q.recheck, jid)
 	q.attempts[jid]++
-	return jid, true
+	return jid, recheck, true
 }
 
 // requeueGhostRepair puts a ghost back without counting the attempt, for rate-limited fetches.
-func (wa *WhatsAppClient) requeueGhostRepair(jid types.JID) {
+func (wa *WhatsAppClient) requeueGhostRepair(jid types.JID, recheck bool) {
 	q := &wa.ghostRepair
 	q.lock.Lock()
 	defer q.lock.Unlock()
 	q.attempts[jid]--
 	if _, ok := q.pending[jid]; !ok {
 		q.pending[jid] = struct{}{}
+		if recheck {
+			q.recheck[jid] = true
+		}
 		q.order = append(q.order, jid)
 	}
 }
@@ -142,20 +169,27 @@ func (wa *WhatsAppClient) clearGhostRepair() {
 	defer q.lock.Unlock()
 	q.order = nil
 	clear(q.pending)
+	clear(q.recheck)
 	q.running = false
 }
 
 func (wa *WhatsAppClient) runGhostRepair() {
 	log := wa.UserLogin.Log.With().Str("action", "repair ghost profiles").Logger()
 	ctx := log.WithContext(wa.Main.Bridge.BackgroundCtx)
-	var synced, failed int
+	var synced, failed, withPicture, noPicture, hidden int
 	defer func() {
 		if synced > 0 || failed > 0 {
-			log.Info().Int("synced", synced).Int("failed", failed).Msg("Finished repairing ghost profiles")
+			log.Info().
+				Int("synced", synced).
+				Int("failed", failed).
+				Int("with_picture", withPicture).
+				Int("no_picture", noPicture).
+				Int("hidden_picture", hidden).
+				Msg("Finished repairing ghost profiles")
 		}
 	}()
 	for {
-		jid, ok := wa.nextGhostRepair()
+		jid, recheck, ok := wa.nextGhostRepairItem()
 		if !ok {
 			return
 		}
@@ -172,16 +206,24 @@ func (wa *WhatsAppClient) runGhostRepair() {
 			continue
 		}
 		syncCtx, cancel := context.WithTimeout(ctx, ghostRepairTimeout)
-		err = wa.syncGhostFromStore(syncCtx, jid, ghost)
+		err = wa.syncGhostFromStore(syncCtx, jid, ghost, recheck)
 		cancel()
 		wait := ghostRepairGap
 		switch {
 		case err == nil:
 			synced++
+			switch {
+			case ghost.AvatarID == "remove":
+				noPicture++
+			case ghost.AvatarID == "unauthorized":
+				hidden++
+			case ghost.AvatarMXC != "":
+				withPicture++
+			}
 		case errors.Is(err, whatsmeow.ErrIQRateOverLimit):
 			log.Warn().Stringer("jid", jid).Dur("backoff", ghostRepairRateLimitBackoff).
 				Msg("Rate limited while fetching profile picture, pausing ghost repair")
-			wa.requeueGhostRepair(jid)
+			wa.requeueGhostRepair(jid, recheck)
 			wait = ghostRepairRateLimitBackoff
 		default:
 			failed++
@@ -198,7 +240,7 @@ func (wa *WhatsAppClient) runGhostRepair() {
 // syncGhostFromStore updates a ghost from the contact store and fetches its profile picture if it
 // has none, then copies the result to the ghost of the user's other JID (LID or phone number).
 // It returns the profile picture fetch error, if any.
-func (wa *WhatsAppClient) syncGhostFromStore(ctx context.Context, jid types.JID, ghost *bridgev2.Ghost) error {
+func (wa *WhatsAppClient) syncGhostFromStore(ctx context.Context, jid types.JID, ghost *bridgev2.Ghost, recheck bool) error {
 	contact, err := wa.GetStore().Contacts.GetContact(ctx, jid)
 	if err != nil {
 		return err
@@ -207,11 +249,11 @@ func (wa *WhatsAppClient) syncGhostFromStore(ctx context.Context, jid types.JID,
 	var fetchErr error
 	if !wa.Main.Config.LazyAvatars {
 		info.ExtraUpdates = bridgev2.MergeExtraUpdaters(info.ExtraUpdates, func(ctx context.Context, ghost *bridgev2.Ghost) bool {
-			if !ghostNeedsAvatar(ghost) {
+			if !recheck && !ghostNeedsAvatar(ghost) {
 				return false
 			}
 			var changed bool
-			changed, fetchErr = wa.updateGhostAvatar(ctx, ghost)
+			changed, fetchErr = wa.updateGhostAvatar(ctx, ghost, recheck)
 			if fetchErr != nil {
 				return allowAvatarRetry(ghost)
 			}
@@ -266,7 +308,7 @@ func (wa *WhatsAppClient) syncContactGhosts(ctx context.Context, contacts []*bri
 			defer func() { <-slots; wg.Done() }()
 			syncCtx, cancel := context.WithDeadline(ctx, deadline)
 			defer cancel()
-			if err := wa.syncGhostFromStore(syncCtx, jid, contact.Ghost); err != nil {
+			if err := wa.syncGhostFromStore(syncCtx, jid, contact.Ghost, false); err != nil {
 				lock.Lock()
 				leftover = append(leftover, jid)
 				lock.Unlock()
@@ -284,8 +326,9 @@ func (wa *WhatsAppClient) syncContactGhosts(ctx context.Context, contacts []*bri
 	}
 }
 
-// startGhostRepairSweep queues every known contact whose ghost still has no profile picture, once
-// per bridge process and login. It covers ghosts that were left stuck before this fix.
+// startGhostRepairSweep runs the ghost profile sweep once per bridge process and login, and then
+// every ghostRepairSweepInterval while the bridge runs. It covers ghosts that were left stuck
+// before the repair existed, and answers from WhatsApp that may have gone stale.
 func (wa *WhatsAppClient) startGhostRepairSweep() {
 	q := &wa.ghostRepair
 	q.lock.Lock()
@@ -303,34 +346,77 @@ func (wa *WhatsAppClient) startGhostRepairSweep() {
 		_ = wa.pushNamesSynced.Wait(timeoutCtx)
 		cancel()
 	}
-	select {
-	case <-ctx.Done():
-		return
-	case <-time.After(ghostRepairSweepDelay):
+	wait := ghostRepairSweepDelay
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(wait):
+		}
+		wait = ghostRepairSweepInterval
+		if wa.IsLoggedIn() {
+			wa.sweepGhostProfiles(ctx)
+		}
 	}
-	if !wa.IsLoggedIn() {
-		return
-	}
+}
+
+// sweepGhostProfiles queues the ghosts of everyone in the contact store and everyone the user has
+// a one-to-one chat with, when they have no profile picture yet or the "no picture" answer is old.
+// DM partners are included because people outside the phone's address book often have no entry in
+// the contact store.
+func (wa *WhatsAppClient) sweepGhostProfiles(ctx context.Context) {
+	log := zerolog.Ctx(ctx)
 	contacts, err := wa.GetStore().Contacts.GetAllContacts(ctx)
 	if err != nil {
 		log.Err(err).Msg("Failed to get contacts for ghost profile sweep")
 		return
 	}
-	var missing []types.JID
+	dmPartners, err := wa.getDMPartners(ctx)
+	if err != nil {
+		log.Err(err).Msg("Failed to get DM partners for ghost profile sweep")
+	}
+	candidates := make(map[types.JID]struct{}, len(contacts)+len(dmPartners))
 	for jid := range contacts {
+		candidates[jid] = struct{}{}
+	}
+	for jid := range dmPartners {
+		candidates[jid] = struct{}{}
+	}
+	var missing, stale []types.JID
+	for jid := range candidates {
 		if jid.Server != types.DefaultUserServer && jid.Server != types.HiddenUserServer {
 			continue
 		}
 		ghost, err := wa.Main.Bridge.GetExistingGhostByID(ctx, waid.MakeUserID(jid))
 		if err != nil {
 			log.Err(err).Stringer("jid", jid).Msg("Failed to get ghost for profile sweep")
-		} else if ghost != nil && ghostNeedsAvatar(ghost) {
+		} else if ghost == nil {
+			continue
+		} else if ghostNeedsAvatar(ghost) {
 			missing = append(missing, jid)
+		} else if noAvatarAnswerStale(ghost, time.Now()) {
+			stale = append(stale, jid)
 		}
 	}
 	log.Info().
 		Int("contacts", len(contacts)).
+		Int("dm_partners", len(dmPartners)).
 		Int("missing_avatar", len(missing)).
+		Int("recheck_no_avatar", len(stale)).
 		Msg("Queued ghosts without a profile picture for repair")
 	wa.queueGhostRepair(missing...)
+	wa.queueGhostRepairWith(true, stale...)
+}
+
+// noAvatarAnswerStale reports whether WhatsApp's "no picture" or "hidden picture" answer for the
+// ghost is old enough to ask again.
+func noAvatarAnswerStale(ghost *bridgev2.Ghost, now time.Time) bool {
+	if ghost.AvatarID != "remove" && ghost.AvatarID != "unauthorized" {
+		return false
+	}
+	meta, ok := ghost.Metadata.(*waid.GhostMetadata)
+	if !ok {
+		return true
+	}
+	return now.Sub(meta.LastSync.Time) > ghostNoAvatarRecheckAge
 }
