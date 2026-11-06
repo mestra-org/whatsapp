@@ -169,6 +169,9 @@ func (wa *WhatsAppConnector) Start(ctx context.Context) error {
 		if err != nil {
 			wa.Bridge.Log.Err(err).Msg("Failed to sync mismatching ghosts")
 		}
+		if err := wa.syncLIDGhostPhones(wa.Bridge.Log.WithContext(wa.Bridge.BackgroundCtx)); err != nil {
+			wa.Bridge.Log.Err(err).Msg("Failed to put phone numbers in LID ghost profiles")
+		}
 	}()
 	return nil
 }
